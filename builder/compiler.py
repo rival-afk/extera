@@ -12,14 +12,11 @@ from .importer import LibraryEmbedder
 
 def get_venv_site_packages() -> Path:
     """Возвращает путь к site-packages текущего venv"""
-    # Проверяем, что мы в venv
     if hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix):
-        # Мы в venv
         for path in sys.path:
             if 'site-packages' in path:
                 return Path(path)
     
-    # Пробуем найти относительно текущего скрипта
     builder_dir = Path(__file__).parent.parent
     venv_path = builder_dir / '.venv'
     if venv_path.exists():
@@ -65,31 +62,31 @@ def compile_plugin(
     if not all_py:
         raise ValueError("Нет .py файлов в папке")
     
-    # Находим все импорты
+    # Находим все импорты (только для определения внешних библиотек)
     all_imports = _find_all_imports(all_py)
     
-    # Фильтруем внешние библиотеки
+    # Фильтруем внешние библиотеки (не из API клиента)
     external_libs = _filter_external_imports(all_imports)
     
     if verbose and external_libs:
         print(f"📦 Внешние библиотеки: {list(external_libs)}")
     
-    # Получаем путь к site-packages
-    site_packages = get_venv_site_packages()
-    if verbose:
-        print(f"📁 Site-packages: {site_packages}")
-    
-    # Встраиваем библиотеки
+    # Встраиваем внешние библиотеки
     embedded_code = ""
-    for lib in external_libs:
-        lib_code = LibraryEmbedder.embed_library(lib, site_packages)
-        if lib_code:
-            embedded_code += lib_code
-            if verbose:
-                print(f"   📚 Встроена: {lib}")
-        else:
-            if verbose:
-                print(f"   ⚠️ Не встроена: {lib}")
+    if external_libs:
+        site_packages = get_venv_site_packages()
+        if verbose:
+            print(f"📁 Site-packages: {site_packages}")
+        
+        for lib in external_libs:
+            lib_code = LibraryEmbedder.embed_library(lib, site_packages)
+            if lib_code:
+                embedded_code += lib_code
+                if verbose:
+                    print(f"   📚 Встроена: {lib}")
+            else:
+                if verbose:
+                    print(f"   ⚠️ Не встроена (установите в venv): {lib}")
     
     # Строим граф зависимостей проекта
     graph = build_dependency_graph(main_file, all_py)
@@ -102,9 +99,12 @@ def compile_plugin(
     # Генерируем содержимое
     content = _generate_plugin_content(
         main_file, dependencies, 
-        all_imports, embedded_code,
+        embedded_code,
         verbose
     )
+    
+    # Добавляем недостающие импорты из typing
+    content = LibraryEmbedder.add_typing_imports(content)
     
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(content)
@@ -142,20 +142,29 @@ def _find_all_imports(py_files: List[Path]) -> Set[str]:
 
 
 def _filter_external_imports(imports: Set[str]) -> Set[str]:
-    """Оставляет только импорты внешних библиотек"""
-    internal_modules = {
+    """Оставляет только импорты внешних библиотек (НЕ из API клиента)"""
+    
+    # API клиента - их НЕ надо встраивать, они доступны в рантайме
+    client_api_modules = {
+        # Основные модули плагинов
         'base_plugin', 'client_utils', 'android_utils',
         'ui', 'file_utils', 'hook_utils', 'markdown_utils',
+        # Встроенные модули Python
         'typing', 'hashlib', 'json', 'base64', 'os', 'time',
         'secrets', 'struct', 'hmac', 're', 'sqlite3', 'threading',
         'collections', 'itertools', 'functools', 'datetime',
         'random', 'math', 'copy', 'pprint', 'logging',
+        'enum', 'abc', 'weakref', 'warnings', 'contextlib',
+        'dataclasses', 'inspect', 'types', 'sys', 'io',
+        'traceback', 'zoneinfo', 'calendar', 'heapq',
+        'bisect', 'array', 'queue', 'subprocess',
     }
     
     external = set()
     for imp in imports:
         base = imp.split('.')[0]
-        if base not in internal_modules and not base.startswith('_'):
+        # Если модуль НЕ в client_api_modules и НЕ начинается с _ (не внутренний)
+        if base not in client_api_modules and not base.startswith('_'):
             external.add(imp)
     
     return external
@@ -164,7 +173,6 @@ def _filter_external_imports(imports: Set[str]) -> Set[str]:
 def _generate_plugin_content(
     main_file: Path,
     dependencies: List[Path],
-    all_imports: Set[str],
     embedded_code: str,
     verbose: bool
 ) -> str:
@@ -175,55 +183,59 @@ def _generate_plugin_content(
     
     # Вставляем код встроенных библиотек
     if embedded_code:
-        result_parts.append("# === Embedded Libraries ===\n")
+        result_parts.append("# === Embedded Libraries (auto-inserted) ===\n")
         result_parts.append(embedded_code)
-        result_parts.append("# === End Embedded Libraries ===\n")
+        result_parts.append("# === End Embedded Libraries ===\n\n")
     
-    # Вставляем зависимости проекта
+    # Вставляем зависимости проекта (удаляем только локальные импорты)
     for dep_file in dependencies:
         with open(dep_file, 'r', encoding='utf-8') as f:
             original = f.read()
-        cleaned = _remove_local_imports(original, local_modules, all_imports)
+        cleaned = _remove_local_imports_only(original, local_modules)
         result_parts.append(f"# --- file: {dep_file.name} ---\n{cleaned}\n")
     
-    # Вставляем main.py
+    # Вставляем main.py (удаляем только локальные импорты)
     with open(main_file, 'r', encoding='utf-8') as f:
         main_original = f.read()
-    main_cleaned = _remove_local_imports(main_original, local_modules, all_imports)
+    main_cleaned = _remove_local_imports_only(main_original, local_modules)
     result_parts.append(main_cleaned)
     
     return '\n'.join(result_parts)
 
 
-def _remove_local_imports(content: str, local_modules: Set[str], all_imports: Set[str]) -> str:
-    """Удаляет импорты локальных модулей и внешних библиотек (они уже встроены)"""
+def _remove_local_imports_only(content: str, local_modules: Set[str]) -> str:
+    """
+    Удаляет ТОЛЬКО импорты локальных модулей.
+    Импорты API клиента (BasePlugin и др.) ОСТАВЛЯЕТ.
+    """
     lines = content.split('\n')
     filtered = []
     
     for line in lines:
         stripped = line.strip()
         
-        # Проверяем локальные импорты
-        is_local = False
+        # Проверяем только локальные импорты (из папки проекта)
+        is_local_import = False
+        
+        # import module_name
         for mod in local_modules:
-            if f'import {mod}' in stripped or f'from {mod}' in stripped:
-                is_local = True
+            if re.match(rf'^import\s+{mod}\b', stripped):
+                is_local_import = True
                 break
-            if f'from .{mod}' in stripped:
-                is_local = True
+            if re.match(rf'^from\s+{mod}\b', stripped):
+                is_local_import = True
+                break
+            if re.match(rf'^from\s+\.{mod}\b', stripped):
+                is_local_import = True
                 break
         
-        if is_local:
-            filtered.append(f"# {line}  # local import removed")
+        # Пропускаем локальные импорты
+        if is_local_import:
+            if filtered and filtered[-1].strip():
+                pass  # просто пропускаем
             continue
         
-        # Проверяем импорты внешних библиотек (они встроены выше)
-        for imp in all_imports:
-            base = imp.split('.')[0]
-            if f'import {base}' in stripped or f'from {base}' in stripped:
-                filtered.append(f"# {line}  # embedded library")
-                break
-        else:
-            filtered.append(line)
+        # Остальные строки (включая from base_plugin import ...) оставляем
+        filtered.append(line)
     
     return '\n'.join(filtered)
